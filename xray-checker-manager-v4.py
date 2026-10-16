@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Xray Checker Bot Manager v4 — standalone; no v3 download required.
+"""Xray Checker Bot Manager v4.1.0 — standalone; no v3 download required.
 
 Standalone manager v4; all bot source is embedded in this file.
 
@@ -22,8 +22,10 @@ import sys
 import tarfile
 import tempfile
 import time
+import re
 from pathlib import Path
 
+MANAGER_VERSION = "4.1.0"
 BOT = Path('/usr/local/bin/xray-checker-bot.py')
 BACKUP_DIR = Path('/var/backups/xray-checker-manager')
 INTERVAL_FILE = Path('/var/lib/xray-checker-telegram-bot/interval_minutes')
@@ -58,6 +60,7 @@ from urllib.parse import urlencode, urlsplit
 from http.client import HTTPSConnection
 from urllib.request import Request, urlopen
 
+BOT_VERSION = "4.1.0"
 BOT_ENV = "/etc/xray-checker-telegram.env"
 XRAY_ENV = "/etc/xray-checker/xray-checker.env"
 METRICS_URL = "http://127.0.0.1:2112/metrics"
@@ -950,7 +953,7 @@ def update_manager_from_github():
             raise RuntimeError("Downloaded file is empty or unexpectedly large")
         candidate = downloaded.decode("utf-8")
         compile(candidate, str(target), "exec")
-        if "Xray Checker Manager v4" not in candidate or "def interactive_menu()" not in candidate:
+        if "MANAGER_VERSION =" not in candidate or "def interactive_menu()" not in candidate or "def show_versions()" not in candidate:
             raise RuntimeError("Downloaded file does not look like the expected v4 manager")
         shutil.copy2(target, backup)
         os.chmod(backup, 0o600)
@@ -969,9 +972,28 @@ def update_manager_from_github():
         print(f"Manager update failed; current version was preserved. Reason: {type(exc).__name__}: {exc}")
 
 
+def installed_bot_version():
+    """Read the version marker from the currently installed bot without executing it."""
+    try:
+        content = BOT.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "not installed"
+    match = re.search(r"^BOT_VERSION\s*=\s*['\"]([^'\"]+)['\"]", content, re.MULTILINE)
+    return match.group(1) if match else "unknown (legacy bot without version marker)"
+
+
+def show_versions():
+    embedded_match = re.search(r"^BOT_VERSION\s*=\s*['\"]([^'\"]+)['\"]", BOT_SOURCE, re.MULTILINE)
+    embedded_version = embedded_match.group(1) if embedded_match else "unknown"
+    print(f"Manager version: {MANAGER_VERSION}")
+    print(f"Installed bot version: {installed_bot_version()}")
+    print(f"Embedded bot version in this Manager: {embedded_version}")
+
+
 def interactive_menu():
     while True:
-        print("\n========== Xray Checker Manager v4 ==========")
+        print(f"\n========== Xray Checker Manager v{MANAGER_VERSION} ==========")
+        print(f"Installed bot version: {installed_bot_version()}")
         print("1) Install / update embedded bot source")
         print("2) Restart the bot service")
         print("3) Create a local backup (keep newest 8)")
@@ -981,6 +1003,7 @@ def interactive_menu():
         print("7) Show bot and reporting service status")
         print("8) Uninstall bot and reporting components")
         print("9) Update Manager itself from GitHub")
+        print("10) Show installed versions")
         print("0) Exit")
         choice = input("Select an option: ").strip()
         try:
@@ -1017,6 +1040,7 @@ def interactive_menu():
                 if state.stdout.strip() == "active": subprocess.run(["systemctl", "restart", "xray-checker-telegram.timer"], check=True)
                 print("Reporting interval updated. Only the reporting timer was changed.")
             elif choice == "7":
+                show_versions()
                 for unit in ("xray-checker-bot.service", "xray-checker-telegram.timer", "xray-checker-telegram.service"):
                     result = subprocess.run(["systemctl", "is-active", unit], capture_output=True, text=True)
                     print(f"{unit}: {result.stdout.strip() or 'unknown'}")
@@ -1039,6 +1063,7 @@ def interactive_menu():
                 subprocess.run(["systemctl", "daemon-reload"], check=False)
                 print("Uninstall completed. The pre-uninstall backup remains in the backup directory.")
             elif choice == "9": update_manager_from_github()
+            elif choice == "10": show_versions()
             elif choice == "0": return
             else: print("Invalid option.")
         except Exception as exc:
@@ -1046,7 +1071,8 @@ def interactive_menu():
         input("Press Enter to continue...")
 
 def main():
-    parser = argparse.ArgumentParser(description='Xray Checker Bot Manager v4 (standalone)')
+    parser = argparse.ArgumentParser(description=f'Xray Checker Bot Manager v{MANAGER_VERSION} (standalone)')
+    parser.add_argument('--version', action='version', version=f'%(prog)s {MANAGER_VERSION}')
     subs = parser.add_subparsers(dest='command', required=False)
     subs.add_parser('backup', help='Create a private backup archive')
     subs.add_parser('install', help='Back up then install the full replacement bot')
