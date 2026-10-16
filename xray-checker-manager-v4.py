@@ -101,13 +101,13 @@ def available_backups():'''
         bot_source = bot_source.replace(old, new, 1)
 
     # Add restart-self button to the main menu.
-    old_menu = '''        [{"text": "📦 Backup / Restore", "callback_data": "backup_menu"}],
-    ])'''
-    new_menu = '''        [{"text": "📦 Backup / Restore", "callback_data": "backup_menu"}],
-        [{"text": "♻️ Restart Bot", "callback_data": "bot_restart_confirm"}],
-    ])'''
-    if old_menu in bot_source:
-        bot_source = bot_source.replace(old_menu, new_menu, 1)
+    # The baseline menu is Persian; anchor on its stable callback_data, not its label.
+    menu_anchor = '        [{"text": "📦 بکاپ و ریستور", "callback_data": "backup_menu"}],'
+    menu_button = menu_anchor + '\n        [{"text": "♻️ ری‌استارت ربات", "callback_data": "bot_restart_confirm"}],'
+    if 'callback_data": "bot_restart_confirm"' not in bot_source:
+        if menu_anchor not in bot_source:
+            raise RuntimeError('Could not find main-menu backup row; refusing to install without Restart Bot button')
+        bot_source = bot_source.replace(menu_anchor, menu_button, 1)
 
     # Add confirm/cancel flow; restart is deferred so the bot can send the reply first.
     anchor = '''        if action == "backup_menu":'''
@@ -126,8 +126,12 @@ def available_backups():'''
                 print(f"Bot restart scheduling failed: {type(exc).__name__}: {exc}", flush=True)
                 show(chat_id, "⚠️ Could not schedule the restart. Check systemd-run permissions and service logs.", main_menu(), message_ref)
         elif action == "backup_menu":'''
-    if anchor in bot_source and 'bot_restart_confirm' not in bot_source:
+    if 'if action == "bot_restart_confirm":' not in bot_source:
+        if anchor not in bot_source:
+            raise RuntimeError('Could not find callback handler insertion point for Restart Bot')
         bot_source = bot_source.replace(anchor, restart_handler, 1)
+    elif 'elif action == "bot_restart_yes":' not in bot_source:
+        raise RuntimeError('Restart Bot confirmation exists but its action handler is missing')
 
     # Send each manually requested backup to the configured admin chat.
     old_backup = '''                archive = create_backup("telegram")
@@ -178,6 +182,52 @@ def generate_manager():
     if old_args in source: source = source.replace(old_args, new_args, 1)
 
     interactive = r'''
+def update_manager_from_github():
+    import urllib.request
+    from datetime import datetime
+
+    manager_url = "https://raw.githubusercontent.com/aliviza1/Xray-Checker-Bot/main/xray-checker-manager-v4.py"
+    target = Path("/root/xray-checker-manager-v4.py")
+    backup_dir = Path("/var/backups/xray-checker-manager")
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(backup_dir, 0o700)
+
+    if not target.is_file():
+        print(f"Manager file not found at {target}; refusing to update.")
+        return
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = backup_dir / f"xray-checker-manager-pre-update-{stamp}.py"
+    temp = target.with_name(target.name + ".download")
+    try:
+        request = urllib.request.Request(manager_url, headers={"User-Agent": "Xray-Checker-Manager-v4"})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            if response.status != 200:
+                raise RuntimeError(f"GitHub returned HTTP {response.status}")
+            downloaded = response.read()
+        if not downloaded or len(downloaded) > 2_000_000:
+            raise RuntimeError("Downloaded file is empty or unexpectedly large")
+        candidate = downloaded.decode("utf-8")
+        compile(candidate, str(target), "exec")
+        if "Xray Checker Bot Manager v4" not in candidate or "def generate_manager()" not in candidate:
+            raise RuntimeError("Downloaded file does not look like the expected v4 manager")
+        shutil.copy2(target, backup)
+        os.chmod(backup, 0o600)
+        temp.write_bytes(downloaded)
+        os.chmod(temp, 0o700)
+        os.replace(temp, target)
+        os.chmod(target, 0o700)
+        print("Manager updated successfully from GitHub.")
+        print(f"Previous version backup: {backup}")
+        print("The currently running menu is still the old process. Exit and run the manager again to use the new version.")
+    except Exception as exc:
+        try:
+            if temp.exists(): temp.unlink()
+        except OSError:
+            pass
+        print(f"Manager update failed; current version was preserved. Reason: {type(exc).__name__}: {exc}")
+
+
 def interactive_menu():
     while True:
         print("\n========== Xray Checker Manager v4 ==========")
@@ -189,6 +239,7 @@ def interactive_menu():
         print("6) Set automatic report interval")
         print("7) Show bot and reporting service status")
         print("8) Uninstall bot and reporting components")
+        print("9) Update Manager itself from GitHub")
         print("0) Exit")
         choice = input("Select an option: ").strip()
         try:
@@ -246,6 +297,7 @@ def interactive_menu():
                     except OSError as exc: print("Failed to remove", p, exc)
                 subprocess.run(["systemctl", "daemon-reload"], check=False)
                 print("Uninstall completed. The pre-uninstall backup remains in the backup directory.")
+            elif choice == "9": update_manager_from_github()
             elif choice == "0": return
             else: print("Invalid option.")
         except Exception as exc:
