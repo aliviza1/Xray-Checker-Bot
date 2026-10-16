@@ -1,1098 +1,281 @@
 #!/usr/bin/env python3
-"""Xray Checker Bot Manager v4.1.0 — standalone; no v3 download required.
+"""Xray Checker Manager v4.2.0 — standalone manager.
 
-Standalone manager v4; all bot source is embedded in this file.
-
-Commands (run as root):
-  python3 xray-checker-manager-v4.py backup
-  python3 xray-checker-manager-v4.py install
-  python3 xray-checker-manager-v4.py list-backups
-  python3 xray-checker-manager-v4.py restore /path/to/backup.tar.gz
-
-This script never reads, edits, stops, enables, disables, or restarts BackPack.
-It never restarts xray-checker.service automatically.
+BackPack is intentionally excluded: this program never reads, changes, stops,
+enables, disables, or restarts BackPack services/configuration.
 """
-import argparse
-import io
-import os
-import shutil
-import stat
-import subprocess
-import sys
-import tarfile
-import tempfile
-import time
-import re
+MANAGER_VERSION = "4.3.0"
+import argparse, os, re, shutil, subprocess, sys, tarfile, tempfile, urllib.request
+from datetime import datetime
 from pathlib import Path
 
-MANAGER_VERSION = "4.1.0"
+MANAGER_PATH = Path('/root/xray-checker-manager-v4.py')
+MANAGER_URL = 'https://raw.githubusercontent.com/aliviza1/Xray-Checker-Bot/main/xray-checker-manager-v4.py'
+BOT_URL = 'https://raw.githubusercontent.com/aliviza1/Xray-Checker-Bot/refs/heads/main/xray-checker-bot.py'
 BOT = Path('/usr/local/bin/xray-checker-bot.py')
+BOT_SERVICE = 'xray-checker-bot.service'
+TIMER = 'xray-checker-telegram.timer'
+REPORT_SERVICE = 'xray-checker-telegram.service'
+METRICS_URL = 'http://45.139.11.96:2112/'
+COMMAND_PATH = Path('/usr/local/bin/xray-checker-manager')
 BACKUP_DIR = Path('/var/backups/xray-checker-manager')
 INTERVAL_FILE = Path('/var/lib/xray-checker-telegram-bot/interval_minutes')
-BACKUP_PATHS = [
-    '/usr/local/bin/xray-checker-bot.py',
-    '/usr/local/bin/xray-checker-telegram.py',
-    '/etc/xray-checker-telegram.env',
-    '/etc/xray-checker/xray-checker.env',
-    '/etc/systemd/system/xray-checker-bot.service',
-    '/etc/systemd/system/xray-checker-telegram.service',
-    '/etc/systemd/system/xray-checker-telegram.timer',
-    '/etc/systemd/system/xray-checker-telegram.timer.d/override.conf',
-    '/var/lib/xray-checker-telegram-bot/interval_minutes',
-]
-
-BOT_SOURCE = r'''#!/usr/bin/env python3
-import os
-import re
-import json
-import ssl
-import socket
-import html
-import base64
-import time
-import subprocess
-import tempfile
-import shutil
-import tarfile
-import io
-from pathlib import Path
-from urllib.parse import urlencode, urlsplit
-from http.client import HTTPSConnection
-from urllib.request import Request, urlopen
-
-BOT_VERSION = "4.1.0"
-BOT_ENV = "/etc/xray-checker-telegram.env"
-XRAY_ENV = "/etc/xray-checker/xray-checker.env"
-METRICS_URL = "http://127.0.0.1:2112/metrics"
-HOST = "api.telegram.org"
-# Existing BackPack TCP relay; this bot only connects to this local endpoint.
-RELAY = ("127.0.0.1", 58615)
-STATE = Path("/var/lib/xray-checker-telegram-bot/offset")
-INTERVAL_FILE = Path("/var/lib/xray-checker-telegram-bot/interval_minutes")
-BACKUP_DIR = Path("/var/backups/xray-checker-manager")
-BACKUP_PATHS = [
-    "/usr/local/bin/xray-checker-bot.py",
-    "/usr/local/bin/xray-checker-telegram.py",
-    "/etc/xray-checker-telegram.env",
-    "/etc/xray-checker/xray-checker.env",
-    "/etc/systemd/system/xray-checker-bot.service",
-    "/etc/systemd/system/xray-checker-telegram.service",
-    "/etc/systemd/system/xray-checker-telegram.timer",
-    "/etc/systemd/system/xray-checker-telegram.timer.d/override.conf",
-    "/var/lib/xray-checker-telegram-bot/interval_minutes",
-]
 INTERVALS = (5, 10, 15, 30, 45, 60, 360, 720)
-awaiting_sub_url = False
-pending_sub_url = None
-pending_restore_name = None
-backup_choices = {}
-
-
-def read_env(path):
-    values = {}
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            if line.startswith("export "):
-                line = line[7:].strip()
-            k, v = line.split("=", 1)
-            values[k.strip()] = v.strip().strip("'\"")
-    return values
-
-
-bot = read_env(BOT_ENV)
-TOKEN = bot.get("TELEGRAM_BOT_TOKEN", "")
-ADMIN = bot.get("TELEGRAM_CHAT_ID", "")
-if not TOKEN or not ADMIN:
-    raise SystemExit("Bot credentials missing from environment file")
-
-
-class RelayHTTPS(HTTPSConnection):
-    def connect(self):
-        raw = socket.create_connection(RELAY, timeout=self.timeout)
-        self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
-
-
-def api(method, params=None, timeout=40):
-    params = params or {}
-    conn = RelayHTTPS(HOST, timeout=timeout, context=ssl.create_default_context())
-    try:
-        if method == "getUpdates":
-            path = f"/bot{TOKEN}/{method}?" + urlencode(params)
-            conn.request("GET", path)
-        else:
-            body = urlencode(params).encode()
-            conn.request("POST", f"/bot{TOKEN}/{method}", body=body,
-                         headers={"Content-Type": "application/x-www-form-urlencoded"})
-        response = conn.getresponse()
-        raw = response.read().decode("utf-8", "replace")
-        data = json.loads(raw)
-        if response.status != 200 or not data.get("ok"):
-            description = data.get("description", f"HTTP {response.status}")
-            if "message is not modified" in description.lower():
-                return data
-            raise RuntimeError(f"Telegram API {method}: {description}")
-        return data
-    finally:
-        conn.close()
-
-
-def get_configs():
-    env = read_env(XRAY_ENV)
-    user, password = env.get("METRICS_USERNAME", ""), env.get("METRICS_PASSWORD", "")
-    if not user or not password:
-        raise RuntimeError("Metrics credentials are missing")
-    req = Request(METRICS_URL)
-    auth = base64.b64encode(f"{user}:{password}".encode()).decode()
-    req.add_header("Authorization", "Basic " + auth)
-    with urlopen(req, timeout=10) as response:
-        raw = response.read().decode("utf-8", "replace")
-    items = {}
-    pattern = re.compile(r'^(xray_proxy_status|xray_proxy_latency_ms)\{(.*?)\}\s+([-+0-9.eE]+)\s*$')
-    for line in raw.splitlines():
-        match = pattern.match(line.strip())
-        if not match:
-            continue
-        metric, label_text, value = match.groups()
-        labels = dict(re.findall(r'(\w+)="((?:\\.|[^"])*)"', label_text))
-        name = labels.get("name") or labels.get("address") or "Unknown"
-        key = labels.get("stable_id") or name
-        item = items.setdefault(key, {"name": name, "status": 0, "latency": 0})
-        if metric == "xray_proxy_status":
-            item["status"] = float(value)
-        else:
-            item["latency"] = float(value)
-    if not items:
-        raise RuntimeError("No Xray Checker metrics found")
-    return sorted(items.values(), key=lambda x: x["name"].casefold())
-
-
-def report_text():
-    configs = get_configs()
-    active = [c for c in configs if c["status"] == 1]
-    inactive = [c for c in configs if c["status"] != 1]
-    lines = [
-        "📡 <b>گزارش وضعیت Xray Checker</b>",
-        f"🕒 <code>{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}</code>",
-        "",
-        f"📊 <b>جمع‌بندی:</b> 🟢 {len(active)} فعال | 🔴 {len(inactive)} غیرفعال",
-        "",
-        "🟢 <b>کانفیگ‌های فعال</b>",
-    ]
-    if active:
-        for c in active:
-            ping = f"{c['latency']:.0f} ms" if c["latency"] > 0 else "پینگ معتبر موجود نیست"
-            lines.append(f"• {html.escape(c['name'])} — <b>{ping}</b>")
-    else:
-        lines.append("• هیچ کانفیگ فعالی یافت نشد")
-    lines += ["", "🔴 <b>کانفیگ‌های غیرفعال</b>"]
-    if inactive:
-        for c in inactive:
-            lines.append(f"• {html.escape(c['name'])} — بدون اتصال معتبر")
-    else:
-        lines.append("• موردی نیست")
-    return "\n".join(lines)
-
-
-def timer_active():
-    result = subprocess.run(["systemctl", "is-active", "xray-checker-telegram.timer"],
-                            capture_output=True, text=True, timeout=10)
-    return result.stdout.strip() == "active"
-
-
-def keyboard(rows):
-    return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
-
-
-def main_menu():
-    return keyboard([
-        [{"text": "📊 وضعیت کانفیگ‌ها", "callback_data": "status"},
-         {"text": "🔄 گزارش فوری", "callback_data": "report"}],
-        [{"text": "⚙️ تنظیمات", "callback_data": "settings"},
-         {"text": "❔ راهنما", "callback_data": "help"}],
-        [{"text": "🔗 مدیریت لینک ساب", "callback_data": "subscription"}],
-        [{"text": "📦 بکاپ و ریستور", "callback_data": "backup_menu"}],
-        [{"text": "♻️ ری‌استارت ربات", "callback_data": "bot_restart_confirm"}],
-    ])
-
-
-def format_interval(minutes):
-    if minutes == 60:
-        return "۱ ساعت"
-    if minutes == 360:
-        return "۶ ساعت"
-    if minutes == 720:
-        return "۱۲ ساعت"
-    return f"{minutes} دقیقه"
-
-
-def interval_minutes():
-    try:
-        value = int(INTERVAL_FILE.read_text().strip())
-        return value if value in INTERVALS else 30
-    except (OSError, ValueError):
-        return 30
-
-
-def set_interval(minutes):
-    if minutes not in INTERVALS:
-        raise ValueError("Unsupported interval")
-    INTERVAL_FILE.parent.mkdir(parents=True, exist_ok=True)
-    temp_state = None
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="ascii", dir=str(INTERVAL_FILE.parent),
-                                         prefix=".interval-", delete=False) as f:
-            temp_state = f.name
-            f.write(str(minutes) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-        os.chmod(temp_state, 0o600)
-        os.replace(temp_state, INTERVAL_FILE)
-        temp_state = None
-    finally:
-        if temp_state and os.path.exists(temp_state):
-            os.unlink(temp_state)
-
-    dropin = Path("/etc/systemd/system/xray-checker-telegram.timer.d/override.conf")
-    dropin.parent.mkdir(parents=True, exist_ok=True)
-    duration = f"{minutes // 60}h" if minutes >= 60 and minutes % 60 == 0 else f"{minutes}min"
-    content = "[Timer]\nOnUnitActiveSec=\nOnUnitActiveSec=" + duration + "\n"
-    temp_dropin = None
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=str(dropin.parent),
-                                         prefix=".timer-override-", delete=False) as f:
-            temp_dropin = f.name
-            f.write(content)
-            f.flush()
-            os.fsync(f.fileno())
-        os.chmod(temp_dropin, 0o600)
-        os.replace(temp_dropin, dropin)
-        temp_dropin = None
-    finally:
-        if temp_dropin and os.path.exists(temp_dropin):
-            os.unlink(temp_dropin)
-
-    subprocess.run(["systemctl", "daemon-reload"], check=True, capture_output=True, text=True, timeout=15)
-    # Only the report timer may be restarted here. BackPack is never referenced or touched.
-    if timer_active():
-        subprocess.run(["systemctl", "restart", "xray-checker-telegram.timer"],
-                       check=True, capture_output=True, text=True, timeout=20)
-
-
-def interval_menu():
-    current = interval_minutes()
-    rows, row = [], []
-    for minutes in INTERVALS:
-        label = f"{'✓ ' if minutes == current else ''}{format_interval(minutes)}"
-        row.append({"text": label, "callback_data": f"interval_{minutes}"})
-        if len(row) == 3:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    rows.append([{"text": "⬅️ بازگشت به تنظیمات", "callback_data": "settings"}])
-    return keyboard(rows)
-
-
-def settings_menu():
-    state = timer_active()
-    toggle = "⏸ خاموش‌کردن گزارش خودکار" if state else "▶️ روشن‌کردن گزارش خودکار"
-    return keyboard([
-        [{"text": toggle, "callback_data": "toggle_auto"}],
-        [{"text": f"⏱ بازهٔ گزارش: هر {format_interval(interval_minutes())}", "callback_data": "intervals"}],
-        [{"text": "🔄 تازه‌سازی وضعیت", "callback_data": "settings"}],
-        [{"text": "⬅️ منوی اصلی", "callback_data": "menu"}],
-    ])
-
-
-def settings_text():
-    state = "🟢 روشن" if timer_active() else "🔴 خاموش"
-    return ("⚙️ <b>تنظیمات گزارش‌دهی</b>\n\n"
-            f"گزارش خودکار: <b>{state}</b>\n"
-            f"بازهٔ فعلی: <b>هر {format_interval(interval_minutes())}</b>\n\n"
-            "خاموش‌کردن گزارش خودکار فقط ارسال زمان‌بندی‌شده را متوقف می‌کند؛ "
-            "بات، مانیتورینگ و تونل‌ها روشن می‌مانند.")
-
-
-def send_message(chat_id, text, markup=None):
-    args = {"chat_id": str(chat_id), "text": text, "parse_mode": "HTML"}
-    if markup:
-        args["reply_markup"] = markup
-    return api("sendMessage", args)
-
-
-def send_document(chat_id, file_path, caption="Xray Checker backup v4"):
-    boundary = "----XrayChecker" + str(time.time_ns())
-    path = Path(file_path)
-    with path.open("rb") as handle:
-        file_bytes = handle.read()
-    fields = [
-        ("chat_id", str(chat_id)),
-        ("caption", caption),
-    ]
-    chunks = []
-    for name, value in fields:
-        chunks.append(("--" + boundary + "\r\n").encode())
-        chunks.append((f'Content-Disposition: form-data; name="{name}"\r\n\r\n').encode())
-        chunks.append(value.encode("utf-8"))
-        chunks.append(b"\r\n")
-    chunks.append(("--" + boundary + "\r\n").encode())
-    chunks.append((f'Content-Disposition: form-data; name="document"; filename="{path.name}"\r\n').encode())
-    chunks.append(b"Content-Type: application/gzip\r\n\r\n")
-    chunks.append(file_bytes)
-    chunks.append(b"\r\n")
-    chunks.append(("--" + boundary + "--\r\n").encode())
-    body = b"".join(chunks)
-    conn = RelayHTTPS(HOST, timeout=90, context=ssl.create_default_context())
-    try:
-        conn.request("POST", f"/bot{TOKEN}/sendDocument", body=body,
-                     headers={"Content-Type": "multipart/form-data; boundary=" + boundary,
-                              "Content-Length": str(len(body))})
-        response = conn.getresponse()
-        raw = response.read().decode("utf-8", "replace")
-        data = json.loads(raw)
-        if response.status != 200 or not data.get("ok"):
-            raise RuntimeError("Telegram sendDocument failed: " + str(data.get("description", response.status)))
-        return data
-    finally:
-        conn.close()
-
-def edit_message(chat_id, message_id, text, markup=None):
-    args = {"chat_id": str(chat_id), "message_id": str(message_id), "text": text, "parse_mode": "HTML"}
-    if markup:
-        args["reply_markup"] = markup
-    return api("editMessageText", args)
-
-
-def show(chat_id, text, markup=None, message=None):
-    if message:
-        edit_message(chat_id, message["message_id"], text, markup)
-    else:
-        send_message(chat_id, text, markup)
-
-
-def valid_subscription_url(value):
-    if not value or len(value) > 4096:
-        return False
-    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in value):
-        return False
-    if '"' in value or "\\" in value or "'" in value or "`" in value:
-        return False
-    try:
-        parsed = urlsplit(value)
-        if parsed.scheme not in ("http", "https") or not parsed.hostname:
-            return False
-        if parsed.username is not None or parsed.password is not None:
-            return False
-        _ = parsed.port
-        return True
-    except ValueError:
-        return False
-
-
-def set_subscription_url(value):
-    if not valid_subscription_url(value):
-        raise ValueError("Invalid subscription URL")
-    path = Path(XRAY_ENV)
-    if not path.is_file():
-        raise RuntimeError("Xray Checker env file not found")
-    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
-    matches = []
-    for index, line in enumerate(lines):
-        body = line.rstrip("\r\n")
-        if re.match(r"^\s*(?:export\s+)?SUBSCRIPTION_URL\s*=", body):
-            matches.append((index, body, line[len(body):]))
-    if len(matches) != 1:
-        raise RuntimeError("Expected exactly one SUBSCRIPTION_URL entry")
-    index, body, ending = matches[0]
-    prefix = re.match(r"^(\s*(?:export\s+)?SUBSCRIPTION_URL\s*=)", body).group(1)
-    lines[index] = prefix + '"' + value + '"' + ending
-    st = path.stat()
-    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + f"-{time.time_ns() % 1_000_000_000:09d}"
-    backup = path.with_name(path.name + ".bak." + stamp)
-    shutil.copy2(path, backup)
-    os.chmod(backup, 0o600)
-    temp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=str(path.parent),
-                                         prefix=".xray-checker-env-", delete=False) as handle:
-            temp_path = handle.name
-            handle.writelines(lines)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chown(temp_path, st.st_uid, st.st_gid)
-        os.chmod(temp_path, stat.S_IMODE(st.st_mode))
-        os.replace(temp_path, path)
-        temp_path = None
-    finally:
-        if temp_path and os.path.exists(temp_path):
-            os.unlink(temp_path)
-    return backup.name
-
-
-def backup_timestamp():
-    return time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + f"-{time.time_ns() % 1_000_000:06d}"
-
-
-def create_backup(label="telegram"):
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    os.chmod(BACKUP_DIR, 0o700)
-    archive = BACKUP_DIR / f"xray-checker-{label}-{backup_timestamp()}.tar.gz"
-    included = []
-    with tarfile.open(archive, "w:gz") as tar:
-        for raw in BACKUP_PATHS:
-            path = Path(raw)
-            if path.is_file():
-                tar.add(str(path), arcname=raw.lstrip("/"), recursive=False)
-                included.append(raw)
-        manifest = ("Xray Checker Bot backup\n"
-                    f"Created UTC: {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}\n"
-                    "BackPack files are intentionally excluded.\n"
-                    "Included files:\n" + "".join(f"- {item}\n" for item in included)).encode("utf-8")
-        info = tarfile.TarInfo("MANIFEST.txt")
-        info.size = len(manifest)
-        info.mode = 0o600
-        tar.addfile(info, io.BytesIO(manifest))
-    os.chmod(archive, 0o600)
-    return archive
-
-
-def available_backups():
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    os.chmod(BACKUP_DIR, 0o700)
-    return sorted(BACKUP_DIR.glob("xray-checker-*.tar.gz"), key=lambda p: p.stat().st_mtime, reverse=True)
-
-
-def restore_backup_from_telegram(filename):
-    # Only accept a basename matching the manager's own archive naming scheme.
-    if not re.fullmatch(r"xray-checker-[A-Za-z0-9_-]+-[0-9]{8}-[0-9]{6}(?:-[0-9]{6})?\.tar\.gz", filename):
-        raise ValueError("Invalid backup filename")
-    archive = (BACKUP_DIR / filename).resolve()
-    if archive.parent != BACKUP_DIR.resolve() or not archive.is_file() or not tarfile.is_tarfile(archive):
-        raise ValueError("Backup not found or invalid")
-
-    allowed = {item.lstrip("/") for item in BACKUP_PATHS}
-    with tarfile.open(archive, "r:gz") as tar:
-        members = [m for m in tar.getmembers() if m.name != "MANIFEST.txt"]
-        if not members:
-            raise ValueError("Backup contains no files")
-        for member in members:
-            member_path = Path(member.name)
-            if member_path.is_absolute() or ".." in member_path.parts or member.name not in allowed or not member.isfile():
-                raise ValueError("Unsafe or unsupported file in backup")
-
-    # Roll back to a fresh pre-restore backup before overwriting anything.
-    create_backup("pre-restore")
-    restored = []
-    with tarfile.open(archive, "r:gz") as tar:
-        for member in tar.getmembers():
-            if member.name == "MANIFEST.txt":
-                continue
-            target = Path("/") / member.name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            source = tar.extractfile(member)
-            if source is None:
-                raise ValueError("Could not read backup member")
-            fd, temp_name = tempfile.mkstemp(prefix=".xray-restore-", dir=str(target.parent))
-            try:
-                with os.fdopen(fd, "wb") as output:
-                    shutil.copyfileobj(source, output)
-                    output.flush()
-                    os.fsync(output.fileno())
-                os.chmod(temp_name, member.mode & 0o777)
-                try:
-                    os.chown(temp_name, member.uid, member.gid)
-                except PermissionError:
-                    pass
-                os.replace(temp_name, target)
-                restored.append(str(target))
-            finally:
-                if os.path.exists(temp_name):
-                    os.unlink(temp_name)
-    # Deliberately do not restart any service here.
-    return restored
-
-
-def backup_menu_text():
-    return ("📦 <b>مدیریت بکاپ و ریستور</b>\n\n"
-            "بکاپ شامل فایل ربات، تنظیمات Checker و فایل‌های سرویس/تایمر است.\n"
-            "فایل‌های BackPack عمداً خارج از بکاپ و ریستور هستند.\n"
-            "آرشیو ممکن است شامل توکن و رمز باشد؛ آن را خصوصی نگه دار.\n\n"
-            "بازیابی، فایل‌های داخل بکاپ را جایگزین می‌کند و هیچ سرویسی را ری‌استارت نمی‌کند.")
-
-
-def backup_menu_keyboard():
-    return keyboard([
-        [{"text": "📦 تهیه بکاپ جدید", "callback_data": "backup_create"}],
-        [{"text": "🗂 فهرست بکاپ‌ها", "callback_data": "backup_list"}],
-        [{"text": "⬅️ منوی اصلی", "callback_data": "menu"}],
-    ])
-
-
-def handle(update):
-    global awaiting_sub_url, pending_sub_url, pending_restore_name, backup_choices
-    callback = update.get("callback_query")
-    if callback:
-        api("answerCallbackQuery", {"callback_query_id": callback["id"]})
-        message = callback.get("message") or {}
-        chat_id = str((message.get("chat") or {}).get("id", ""))
-        if chat_id != ADMIN:
-            return
-        message_ref = message if message.get("message_id") else None
-        action = callback.get("data", "")
-        if action == "bot_restart_confirm":
-            show(chat_id, "⚠️ <b>راه‌اندازی مجدد خود ربات</b>\n\nفقط سرویس xray-checker-bot.service ری‌استارت می‌شود. Xray Checker و BackPack دست‌نخورده می‌مانند. ادامه می‌دهی؟",
-                 keyboard([[{"text": "♻️ Yes, restart", "callback_data": "bot_restart_yes"}],
-                           [{"text": "❌ Cancel", "callback_data": "menu"}]]), message_ref)
-        elif action == "bot_restart_yes":
-            try:
-                unit = "xray-checker-bot-restart-" + str(time.time_ns())
-                subprocess.run(["systemd-run", "--quiet", "--unit=" + unit, "--on-active=3s",
-                                "/usr/bin/systemctl", "restart", "xray-checker-bot.service"],
-                               check=True, capture_output=True, text=True, timeout=15)
-                show(chat_id, "✅ Bot restart scheduled. The bot may be unavailable for a few seconds.", None, message_ref)
-            except Exception as exc:
-                print(f"Bot restart scheduling failed: {type(exc).__name__}: {exc}", flush=True)
-                show(chat_id, "⚠️ Could not schedule the restart. Check systemd-run permissions and service logs.", main_menu(), message_ref)
-        elif action == "backup_menu":
-            show(chat_id, backup_menu_text(), backup_menu_keyboard(), message_ref)
-        elif action == "backup_create":
-            try:
-                archive = create_backup("telegram")
-                send_document(chat_id, archive, "Xray Checker Bot backup v4 — may contain secrets; keep private")
-                show(chat_id, "✅ <b>بکاپ ساخته و به همین چت ارسال شد.</b>\n\n"
-                     f"📄 <code>{html.escape(archive.name)}</code>\n"
-                     f"حجم: {archive.stat().st_size} بایت\n\n"
-                     "آرشیو در مسیر خصوصی سرور ذخیره شده است.", backup_menu_keyboard(), message_ref)
-            except Exception as exc:
-                print(f"Backup creation failed: {type(exc).__name__}: {exc}", flush=True)
-                show(chat_id, "⚠️ ساخت بکاپ ناموفق بود. گزارش سرویس ربات را بررسی کن.", backup_menu_keyboard(), message_ref)
-        elif action == "backup_list":
-            files = available_backups()[:8]
-            if not files:
-                show(chat_id, "🗂 هنوز بکاپی پیدا نشد.", backup_menu_keyboard(), message_ref)
-            else:
-                rows = []
-                backup_choices = {str(index): item.name for index, item in enumerate(files)}
-                for index, item in enumerate(files):
-                    stamp = item.stat().st_mtime
-                    date_text = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(stamp))
-                    rows.append([{"text": f"♻️ {date_text} · {item.stat().st_size // 1024} KB",
-                                  "callback_data": f"backup_pick_{index}"}])
-                rows.append([{"text": "⬅️ بازگشت", "callback_data": "backup_menu"}])
-                show(chat_id, "🗂 <b>بکاپ‌های اخیر</b>\nبرای انتخاب نسخه جهت ریستور، روی آن بزن:", keyboard(rows), message_ref)
-        elif action.startswith("backup_pick_"):
-            choice_id = action[len("backup_pick_"):]
-            filename = backup_choices.get(choice_id)
-            known = {p.name for p in available_backups()}
-            if not filename or filename not in known:
-                show(chat_id, "⚠️ این انتخاب منقضی شده؛ فهرست بکاپ‌ها را دوباره باز کن.", backup_menu_keyboard(), message_ref)
-            else:
-                pending_restore_name = filename
-                show(chat_id, "⚠️ <b>تأیید ریستور</b>\n\n"
-                     f"نسخه انتخاب‌شده: <code>{html.escape(filename)}</code>\n\n"
-                     "ریستور فایل‌های موجود در این بکاپ را جایگزین می‌کند. پیش از آن از وضعیت فعلی هم بکاپ گرفته می‌شود.\n"
-                     "هیچ سرویسی ری‌استارت نمی‌شود و فایل‌های BackPack دست‌نخورده می‌مانند.\n\n"
-                     "آیا ادامه می‌دهی؟",
-                     keyboard([[{"text": "♻️ بله، ریستور کن", "callback_data": "backup_restore_yes"}],
-                               [{"text": "❌ لغو", "callback_data": "backup_restore_no"}]]), message_ref)
-        elif action == "backup_restore_no":
-            pending_restore_name = None
-            show(chat_id, "❌ ریستور لغو شد.", backup_menu_keyboard(), message_ref)
-        elif action == "backup_restore_yes":
-            if not pending_restore_name:
-                show(chat_id, "⌛ انتخاب بکاپ منقضی شده؛ دوباره از فهرست انتخاب کن.", backup_menu_keyboard(), message_ref)
-            else:
-                filename = pending_restore_name
-                pending_restore_name = None
-                try:
-                    restored = restore_backup_from_telegram(filename)
-                    show(chat_id, "✅ <b>ریستور انجام شد.</b>\n\n"
-                         f"تعداد فایل‌های بازیابی‌شده: {len(restored)}\n"
-                         "هیچ سرویسی ری‌استارت نشد. برای اعمال سورس ربات بازیابی‌شده، در صورت نیاز ربات را جداگانه ری‌استارت کن.",
-                         backup_menu_keyboard(), message_ref)
-                except Exception as exc:
-                    print(f"Backup restore failed: {type(exc).__name__}: {exc}", flush=True)
-                    show(chat_id, "⚠️ ریستور ناموفق بود. وضعیت فایل‌ها و لاگ ربات را بررسی کن.", backup_menu_keyboard(), message_ref)
-        elif action == "subscription":
-            awaiting_sub_url, pending_sub_url = True, None
-            show(chat_id, "🔗 <b>مدیریت لینک ساب</b>\n\nلینک جدید را ارسال کن. تا زمان تأیید، فایل تنظیمات تغییر نمی‌کند.\nبرای امنیت، لینک در پیام تأیید نمایش داده نمی‌شود.",
-                 keyboard([[{"text": "❌ لغو", "callback_data": "sub_cancel"}], [{"text": "⬅️ منوی اصلی", "callback_data": "menu"}]]), message_ref)
-        elif action == "sub_confirm":
-            if not pending_sub_url:
-                awaiting_sub_url = False
-                show(chat_id, "⌛ درخواست منقضی شده؛ دوباره از منوی مدیریت لینک ساب شروع کن.", main_menu(), message_ref)
-            else:
-                try:
-                    backup_name = set_subscription_url(pending_sub_url)
-                    pending_sub_url, awaiting_sub_url = None, False
-                    show(chat_id, "✅ <b>لینک ساب در فایل تنظیمات ذخیره شد.</b>\n"
-                         f"📦 نسخهٔ پشتیبان: <code>{html.escape(backup_name)}</code>\n\n"
-                         "برای اعمال تنظیم جدید، دکمهٔ Restart را جداگانه بزن.",
-                         keyboard([[{"text": "🔄 راه‌اندازی مجدد Xray Checker", "callback_data": "sub_restart"}],
-                                   [{"text": "⬅️ منوی اصلی", "callback_data": "menu"}]]), message_ref)
-                except Exception as exc:
-                    pending_sub_url, awaiting_sub_url = None, False
-                    print(f"Subscription update failed: {type(exc).__name__}", flush=True)
-                    show(chat_id, "⚠️ ذخیره لینک انجام نشد. فایل تنظیمات و گزارش سرویس را بررسی کن.", main_menu(), message_ref)
-        elif action == "sub_cancel":
-            awaiting_sub_url, pending_sub_url = False, None
-            show(chat_id, "❌ عملیات تغییر لینک لغو شد.", main_menu(), message_ref)
-        elif action == "sub_restart":
-            try:
-                loaded = subprocess.run(["systemctl", "show", "xray-checker.service", "-p", "LoadState", "--value"],
-                                        capture_output=True, text=True, timeout=10)
-                if loaded.returncode != 0 or loaded.stdout.strip() != "loaded":
-                    msg = "⚠️ سرویس xray-checker.service در systemd قابل دسترسی نیست."
-                else:
-                    result = subprocess.run(["systemctl", "restart", "xray-checker.service"],
-                                            capture_output=True, text=True, timeout=45)
-                    check = subprocess.run(["systemctl", "is-active", "xray-checker.service"],
-                                           capture_output=True, text=True, timeout=10)
-                    msg = ("✅ سرویس Xray Checker راه‌اندازی شد." if result.returncode == 0 and check.stdout.strip() == "active"
-                           else "⚠️ فعال‌شدن سرویس پس از Restart تأیید نشد؛ وضعیت سرویس را بررسی کن.")
-            except Exception:
-                msg = "⚠️ بررسی یا راه‌اندازی مجدد سرویس ناموفق بود؛ وضعیت سرویس را دستی بررسی کن."
-            show(chat_id, msg, main_menu(), message_ref)
-        elif action == "menu":
-            awaiting_sub_url, pending_sub_url = False, None
-            show(chat_id, "📡 <b>Xray Checker Bot</b>\nیک گزینه را انتخاب کن:", main_menu(), message_ref)
-        elif action in ("status", "report"):
-            awaiting_sub_url, pending_sub_url = False, None
-            try:
-                show(chat_id, report_text(), main_menu(), message_ref)
-            except Exception as exc:
-                show(chat_id, f"⚠️ دریافت گزارش ناموفق بود: <code>{html.escape(str(exc))}</code>", main_menu(), message_ref)
-        elif action == "settings":
-            awaiting_sub_url, pending_sub_url = False, None
-            show(chat_id, settings_text(), settings_menu(), message_ref)
-        elif action == "intervals":
-            show(chat_id, "⏱ <b>انتخاب بازهٔ گزارش خودکار</b>\n\n"
-                 f"بازهٔ فعلی: هر {format_interval(interval_minutes())}", interval_menu(), message_ref)
-        elif action.startswith("interval_"):
-            try:
-                minutes = int(action.split("_", 1)[1])
-                set_interval(minutes)
-                show(chat_id, f"✅ بازهٔ گزارش خودکار روی <b>هر {format_interval(minutes)}</b> تنظیم شد.\n\n" + settings_text(),
-                     settings_menu(), message_ref)
-            except Exception as exc:
-                show(chat_id, "⚠️ تغییر بازه انجام نشد: <code>" + html.escape(str(exc)) + "</code>", settings_menu(), message_ref)
-        elif action == "toggle_auto":
-            if timer_active():
-                subprocess.run(["systemctl", "disable", "--now", "xray-checker-telegram.timer"], check=True, capture_output=True, text=True, timeout=20)
-            else:
-                subprocess.run(["systemctl", "enable", "--now", "xray-checker-telegram.timer"], check=True, capture_output=True, text=True, timeout=20)
-            show(chat_id, settings_text(), settings_menu(), message_ref)
-        elif action == "help":
-            awaiting_sub_url, pending_sub_url = False, None
-            show(chat_id, "❔ <b>راهنما</b>\n/start — منوی اصلی\n/status — وضعیت کانفیگ‌ها\n/report — ارسال گزارش فوری\n/settings — تنظیمات گزارش خودکار",
-                 main_menu(), message_ref)
-        return
-
-    message = update.get("message") or {}
-    chat_id = str((message.get("chat") or {}).get("id", ""))
-    if chat_id != ADMIN:
-        return
-    incoming = (message.get("text") or "").strip()
-    command = incoming.split("@", 1)[0].lower()
-    if awaiting_sub_url and incoming and not incoming.startswith("/"):
-        awaiting_sub_url = False
-        if not valid_subscription_url(incoming):
-            pending_sub_url = None
-            send_message(chat_id, "⚠️ لینک معتبر نیست. آدرس کامل HTTP یا HTTPS بدون فاصله و اطلاعات ورود بفرست؛ سپس دوباره از منوی مدیریت ساب شروع کن.", main_menu())
-            return
-        pending_sub_url = incoming
-        send_message(chat_id, "🔐 <b>تأیید تغییر لینک ساب</b>\n\nلینک از نظر ساختار اولیه قابل قبول است. برای ذخیره تأیید کن؛ هنوز فایلی تغییر نکرده است.",
-                     keyboard([[{"text": "✅ تأیید و ذخیره", "callback_data": "sub_confirm"}], [{"text": "❌ لغو", "callback_data": "sub_cancel"}]]))
-        return
-    if command in ("/start", "/menu"):
-        awaiting_sub_url, pending_sub_url = False, None
-        show(chat_id, "📡 <b>Xray Checker Bot</b>\nخوش آمدی! از منوی زیر استفاده کن:", main_menu())
-    elif command in ("/status", "/report"):
-        awaiting_sub_url, pending_sub_url = False, None
-        try:
-            show(chat_id, report_text(), main_menu())
-        except Exception as exc:
-            show(chat_id, f"⚠️ دریافت گزارش ناموفق بود: <code>{html.escape(str(exc))}</code>", main_menu())
-    elif command == "/settings":
-        awaiting_sub_url, pending_sub_url = False, None
-        show(chat_id, settings_text(), settings_menu())
-    elif command == "/help":
-        awaiting_sub_url, pending_sub_url = False, None
-        show(chat_id, "❔ <b>راهنما</b>\n/start — منوی اصلی\n/status — وضعیت کانفیگ‌ها\n/report — ارسال گزارش فوری\n/settings — تنظیمات گزارش خودکار", main_menu())
-
-
-def load_offset():
-    try:
-        return int(STATE.read_text().strip())
-    except (OSError, ValueError):
-        return 0
-
-
-def save_offset(value):
-    STATE.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="ascii", dir=str(STATE.parent), prefix=".offset-", delete=False) as f:
-            temp_path = f.name
-            f.write(str(value))
-            f.flush()
-            os.fsync(f.fileno())
-        os.chmod(temp_path, 0o600)
-        os.replace(temp_path, STATE)
-        temp_path = None
-    finally:
-        if temp_path and os.path.exists(temp_path):
-            os.unlink(temp_path)
-
-
-def main():
-    offset = load_offset()
-    print("Interactive Xray Checker bot started", flush=True)
-    while True:
-        try:
-            result = api("getUpdates", {"offset": offset, "timeout": 25,
-                                         "allowed_updates": json.dumps(["message", "callback_query"])}, timeout=40)
-            for update in result.get("result", []):
-                offset = update["update_id"] + 1
-                try:
-                    handle(update)
-                except Exception as exc:
-                    print(f"Update handling failed: {type(exc).__name__}: {exc}", flush=True)
-                finally:
-                    save_offset(offset)
-        except Exception as exc:
-            print(f"Polling error: {type(exc).__name__}: {exc}", flush=True)
-            time.sleep(5)
-
-
-if __name__ == "__main__":
-    main()
-'''
-
+# Explicit allowlist only. No /etc/backpack or BackPack service/config paths.
+BACKUP_PATHS = [
+    Path('/usr/local/bin/xray-checker-bot.py'),
+    Path('/usr/local/bin/xray-checker-telegram.py'),
+    Path('/etc/xray-checker-telegram.env'),
+    Path('/etc/xray-checker/xray-checker.env'),
+    Path('/etc/systemd/system/xray-checker-bot.service'),
+    Path('/etc/systemd/system/xray-checker-telegram.service'),
+    Path('/etc/systemd/system/xray-checker-telegram.timer'),
+    Path('/etc/systemd/system/xray-checker-telegram.timer.d/override.conf'),
+    INTERVAL_FILE,
+]
 
 def require_root():
     if os.geteuid() != 0:
-        raise SystemExit('ERROR: run as root, for example: sudo python3 xray-checker-manager-v4.py install')
+        raise SystemExit('Please run as root: sudo python3 /root/xray-checker-manager-v4.py')
 
+def run(cmd, check=False):
+    return subprocess.run(cmd, check=check, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
-def timestamp():
-    return time.strftime('%Y%m%d-%H%M%S', time.gmtime())
+def fetch(url, limit=2_000_000):
+    req = urllib.request.Request(url, headers={'User-Agent': 'Xray-Checker-Manager/' + MANAGER_VERSION})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = r.read(limit + 1)
+    if not data or len(data) > limit:
+        raise RuntimeError('Download empty or unexpectedly large')
+    return data.decode('utf-8')
 
+def extract_version(source):
+    for pattern in (r'^MANAGER_VERSION\s*=\s*[\'\"]([^\'\"]+)', r'^BOT_VERSION\s*=\s*[\'\"]([^\'\"]+)'):
+        m = re.search(pattern, source, re.M)
+        if m: return m.group(1)
+    return 'unknown (no version marker)'
 
-def ensure_backup_dir():
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    os.chmod(BACKUP_DIR, 0o700)
-
-
-def backup_files(label='manual'):
-    ensure_backup_dir()
-    archive = BACKUP_DIR / f'xray-checker-{label}-{timestamp()}-{time.time_ns() % 1_000_000:06d}.tar.gz'
-    included = []
-    with tarfile.open(archive, 'w:gz') as tar:
-        for raw in BACKUP_PATHS:
-            p = Path(raw)
-            if p.is_file():
-                tar.add(str(p), arcname=raw.lstrip('/'), recursive=False)
-                included.append(raw)
-        manifest = ('Xray Checker Bot backup\n'
-                    f'Created UTC: {time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())}\n'
-                    'BackPack files are intentionally excluded and never modified.\n'
-                    'Included files:\n' + ''.join(f'- {p}\n' for p in included)).encode()
-        info = tarfile.TarInfo('MANIFEST.txt')
-        info.size = len(manifest)
-        info.mode = 0o600
-        tar.addfile(info, io.BytesIO(manifest))
-    os.chmod(archive, 0o600)
-    # Retain only newest eight manager archives; prune oldest first.
-    backups = sorted(BACKUP_DIR.glob('xray-checker-*.tar.gz'), key=lambda p: p.stat().st_mtime, reverse=True)
-    for stale in backups[8:]:
-        try:
-            stale.unlink()
-        except OSError as exc:
-            print(f'WARNING: could not remove old backup {stale}: {exc}')
-    print(f'Backup created: {archive}')
-    print(f'Included {len(included)} files.')
-    print('WARNING: backup may contain Telegram tokens, passwords, and private configuration. Keep it private.')
-    return archive
-
-
-def list_backups():
-    ensure_backup_dir()
-    files = sorted(BACKUP_DIR.glob('xray-checker-*.tar.gz'), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not files:
-        print(f'No backups found in {BACKUP_DIR}')
-    for p in files:
-        print(f'{p} ({p.stat().st_size} bytes)')
-
-
-def install():
-    require_root()
-    # Validate embedded source before touching the installed bot.
-    compile(BOT_SOURCE, str(BOT), 'exec')
-    backup_files('pre-install-v2')
-    BOT.parent.mkdir(parents=True, exist_ok=True)
-    old_stat = BOT.stat() if BOT.exists() else None
-    fd, temp_name = tempfile.mkstemp(prefix='.xray-checker-bot-v2-', dir=str(BOT.parent))
+def bot_versions():
+    installed = extract_version(BOT.read_text(errors='replace')) if BOT.is_file() else 'not installed'
     try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            f.write(BOT_SOURCE)
-            f.flush()
-            os.fsync(f.fileno())
-        if old_stat:
-            os.chown(temp_name, old_stat.st_uid, old_stat.st_gid)
-            os.chmod(temp_name, stat.S_IMODE(old_stat.st_mode))
-        else:
-            os.chmod(temp_name, 0o755)
-        os.replace(temp_name, BOT)
-    finally:
-        if os.path.exists(temp_name):
-            os.unlink(temp_name)
-    subprocess.run(['/usr/bin/python3', '-m', 'py_compile', str(BOT)], check=True, capture_output=True, text=True)
-    # Ensure interval state is one of the supported values; preserve valid existing setting.
-    INTERVAL_FILE.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        current = int(INTERVAL_FILE.read_text().strip())
-    except (OSError, ValueError):
-        current = 30
-    if current not in (5, 10, 15, 30, 45, 60, 360, 720):
-        current = 30
-    INTERVAL_FILE.write_text(f'{current}\n', encoding='ascii')
-    os.chmod(INTERVAL_FILE, 0o600)
-    # Keep the persisted choice and the systemd timer override in sync.
-    dropin = Path('/etc/systemd/system/xray-checker-telegram.timer.d/override.conf')
-    dropin.parent.mkdir(parents=True, exist_ok=True)
-    duration = f'{current // 60}h' if current >= 60 and current % 60 == 0 else f'{current}min'
-    dropin.write_text('[Timer]\nOnUnitActiveSec=\nOnUnitActiveSec=' + duration + '\n', encoding='utf-8')
-    os.chmod(dropin, 0o600)
-    subprocess.run(['/usr/bin/systemctl', 'daemon-reload'], check=True, capture_output=True, text=True)
-    # If active, refresh only the report timer so the selected interval takes effect.
-    timer_state = subprocess.run(['/usr/bin/systemctl', 'is-active', 'xray-checker-telegram.timer'],
-                                 capture_output=True, text=True)
-    if timer_state.stdout.strip() == 'active':
-        subprocess.run(['/usr/bin/systemctl', 'restart', 'xray-checker-telegram.timer'],
-                       check=True, capture_output=True, text=True)
-    print(f'Installed replacement bot source to {BOT}')
-    print('Python syntax check passed.')
-    print('Only xray-checker-telegram.timer may have been refreshed to apply its reporting interval.')
-    print('Bot service has NOT been restarted. xray-checker.service has NOT been restarted.')
-    print('BackPack was not read, modified, stopped, or restarted.')
-    print('When you are ready, manually restart only the bot with: sudo systemctl restart xray-checker-bot.service')
-
-
-def restore(archive_path):
-    require_root()
-    archive = Path(archive_path).resolve()
-    if not archive.is_file() or not tarfile.is_tarfile(archive):
-        raise SystemExit('ERROR: invalid backup archive path.')
-    print('Restore overwrites only files included in this backup. BackPack files are excluded.')
-    print('No service will be restarted by restore.')
-    if input('Type RESTORE to continue: ').strip() != 'RESTORE':
-        print('Restore cancelled.')
-        return
-    backup_files('pre-restore')
-    allowed = {p.lstrip('/') for p in BACKUP_PATHS}
-    with tarfile.open(archive, 'r:gz') as tar:
-        members = [m for m in tar.getmembers() if m.name != 'MANIFEST.txt']
-        for m in members:
-            p = Path(m.name)
-            if p.is_absolute() or '..' in p.parts or m.name not in allowed or not m.isfile():
-                raise SystemExit(f'ERROR: unsafe/unexpected archive member: {m.name}')
-        for m in members:
-            target = Path('/') / m.name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            source = tar.extractfile(m)
-            if source is None:
-                raise SystemExit(f'ERROR: cannot read {m.name}')
-            fd, temp_name = tempfile.mkstemp(prefix='.xray-restore-', dir=str(target.parent))
-            try:
-                with os.fdopen(fd, 'wb') as out:
-                    shutil.copyfileobj(source, out)
-                    out.flush()
-                    os.fsync(out.fileno())
-                os.chmod(temp_name, m.mode & 0o777)
-                try:
-                    os.chown(temp_name, m.uid, m.gid)
-                except PermissionError:
-                    pass
-                os.replace(temp_name, target)
-            finally:
-                if os.path.exists(temp_name):
-                    os.unlink(temp_name)
-            print(f'Restored {target}')
-    print('Restore complete. No service restart was performed.')
-
-
-
-def update_manager_from_github():
-    import urllib.request
-    from datetime import datetime
-
-    manager_url = "https://raw.githubusercontent.com/aliviza1/Xray-Checker-Bot/main/xray-checker-manager-v4.py"
-    target = Path("/root/xray-checker-manager-v4.py")
-    backup_dir = Path("/var/backups/xray-checker-manager")
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    os.chmod(backup_dir, 0o700)
-
-    if not target.is_file():
-        print(f"Manager file not found at {target}; refusing to update.")
-        return
-
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    backup = backup_dir / f"xray-checker-manager-pre-update-{stamp}.py"
-    temp = target.with_name(target.name + ".download")
-    try:
-        request = urllib.request.Request(manager_url, headers={"User-Agent": "Xray-Checker-Manager-v4"})
-        with urllib.request.urlopen(request, timeout=30) as response:
-            if response.status != 200:
-                raise RuntimeError(f"GitHub returned HTTP {response.status}")
-            downloaded = response.read()
-        if not downloaded or len(downloaded) > 2_000_000:
-            raise RuntimeError("Downloaded file is empty or unexpectedly large")
-        candidate = downloaded.decode("utf-8")
-        compile(candidate, str(target), "exec")
-        if "MANAGER_VERSION =" not in candidate or "def interactive_menu()" not in candidate or "def show_versions()" not in candidate:
-            raise RuntimeError("Downloaded file does not look like the expected v4 manager")
-        shutil.copy2(target, backup)
-        os.chmod(backup, 0o600)
-        temp.write_bytes(downloaded)
-        os.chmod(temp, 0o700)
-        os.replace(temp, target)
-        os.chmod(target, 0o700)
-        print("Manager updated successfully from GitHub.")
-        print(f"Previous version backup: {backup}")
-        print("The currently running menu is still the old process. Exit and run the manager again to use the new version.")
-    except Exception as exc:
-        try:
-            if temp.exists(): temp.unlink()
-        except OSError:
-            pass
-        print(f"Manager update failed; current version was preserved. Reason: {type(exc).__name__}: {exc}")
-
-
-def installed_bot_version():
-    """Read the version marker from the currently installed bot without executing it."""
-    try:
-        content = BOT.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return "not installed"
-    match = re.search(r"^BOT_VERSION\s*=\s*['\"]([^'\"]+)['\"]", content, re.MULTILINE)
-    return match.group(1) if match else "unknown (legacy bot without version marker)"
-
+        latest_source = fetch(BOT_URL)
+        latest = extract_version(latest_source)
+        if latest == 'unknown (no version marker)': latest = 'unversioned GitHub source'
+    except Exception as e:
+        latest = 'unavailable (' + type(e).__name__ + ')'
+    return installed, latest
 
 def show_versions():
-    embedded_match = re.search(r"^BOT_VERSION\s*=\s*['\"]([^'\"]+)['\"]", BOT_SOURCE, re.MULTILINE)
-    embedded_version = embedded_match.group(1) if embedded_match else "unknown"
-    print(f"Manager version: {MANAGER_VERSION}")
-    print(f"Installed bot version: {installed_bot_version()}")
-    print(f"Embedded bot version in this Manager: {embedded_version}")
+    print('Manager version:', MANAGER_VERSION)
+    print('Installed manager file:', MANAGER_PATH if MANAGER_PATH.exists() else 'not found at standard path')
+    installed, latest = bot_versions()
+    print('Installed bot version:', installed)
+    print('Latest GitHub bot version:', latest)
+    print('Note: legacy bot files without BOT_VERSION cannot be identified reliably.')
 
+def make_backup(label='manual'):
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(BACKUP_DIR, 0o700)
+    stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    archive = BACKUP_DIR / f'xray-checker-{label}-{stamp}.tar.gz'
+    included = [p for p in BACKUP_PATHS if p.exists() and (p.is_file() or p.is_symlink())]
+    with tarfile.open(archive, 'w:gz') as tf:
+        for p in included:
+            tf.add(p, arcname=str(p).lstrip('/'), recursive=False)
+    os.chmod(archive, 0o600)
+    archives = sorted(BACKUP_DIR.glob('xray-checker-*.tar.gz'), key=lambda p: p.stat().st_mtime, reverse=True)
+    for old in archives[8:]:
+        try: old.unlink()
+        except OSError as e: print('Warning: cannot prune', old, e)
+    print('Backup created:', archive)
+    print('Included files:', len(included))
+    print('Security: archive may contain Telegram tokens, passwords, or subscription URLs; keep it private.')
+    print('BackPack configuration and services were excluded.')
+    return archive
 
-def interactive_menu():
-    while True:
-        print(f"\n========== Xray Checker Manager v{MANAGER_VERSION} ==========")
-        print(f"Installed bot version: {installed_bot_version()}")
-        print("1) Install / update embedded bot source")
-        print("2) Restart the bot service")
-        print("3) Create a local backup (keep newest 8)")
-        print("4) List local backups")
-        print("5) Restore a local backup")
-        print("6) Set automatic report interval")
-        print("7) Show bot and reporting service status")
-        print("8) Uninstall bot and reporting components")
-        print("9) Update Manager itself from GitHub")
-        print("10) Show installed versions")
-        print("0) Exit")
-        choice = input("Select an option: ").strip()
+def list_backups():
+    files = sorted(BACKUP_DIR.glob('xray-checker-*.tar.gz'), key=lambda p: p.stat().st_mtime, reverse=True) if BACKUP_DIR.exists() else []
+    if not files: print('No local backups found.'); return
+    for p in files: print(f'{p.stat().st_size:>10} bytes  {datetime.fromtimestamp(p.stat().st_mtime).isoformat(timespec="seconds")}  {p}')
+
+def safe_restore(archive_path):
+    archive = Path(archive_path).resolve()
+    if not archive.is_file() or archive.suffixes[-2:] != ['.tar', '.gz']:
+        raise RuntimeError('Select an existing .tar.gz backup file')
+    allowed = {str(p).lstrip('/') for p in BACKUP_PATHS}
+    with tarfile.open(archive, 'r:gz') as tf:
+        members = []
+        for m in tf.getmembers():
+            name = m.name.lstrip('./')
+            if name not in allowed:
+                raise RuntimeError('Archive contains an unexpected path; restore aborted: ' + m.name)
+            if not (m.isfile() or m.issym()):
+                raise RuntimeError('Archive contains a non-file entry; restore aborted')
+            members.append((m, name))
+        if not members: raise RuntimeError('No supported files in this archive')
+        print('Files to restore:')
+        for _, name in members: print(' ', '/' + name)
+        if input('Type RESTORE to continue: ').strip() != 'RESTORE': print('Cancelled.'); return
+        # Extract only after strict allowlist validation, one file at a time.
+        for m, name in members:
+            dest = Path('/') / name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            src = tf.extractfile(m)
+            if src is None: continue
+            data = src.read()
+            tmp = dest.with_name(dest.name + '.restore-tmp')
+            tmp.write_bytes(data)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, dest)
+            print('Restored:', dest)
+    run(['systemctl', 'daemon-reload'])
+    print('Restore completed. Services were not restarted automatically.')
+
+def update_manager():
+    if not MANAGER_PATH.is_file():
+        print('Manager file not found:', MANAGER_PATH); return
+    temp = None
+    try:
+        source = fetch(MANAGER_URL)
+        compile(source, str(MANAGER_PATH), 'exec')
+        version = extract_version(source)
+        if version == 'unknown (no version marker)' or 'BackPack is intentionally excluded' not in source:
+            raise RuntimeError('GitHub file is missing expected version/safety markers')
+        if version == MANAGER_VERSION:
+            print('GitHub manager version matches this version:', version)
+        stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True); os.chmod(BACKUP_DIR, 0o700)
+        backup = BACKUP_DIR / f'xray-checker-manager-pre-update-{stamp}.py'
+        shutil.copy2(MANAGER_PATH, backup); os.chmod(backup, 0o600)
+        fd, tmp_name = tempfile.mkstemp(prefix='.manager-', suffix='.py', dir=str(MANAGER_PATH.parent))
+        temp = Path(tmp_name)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f: f.write(source)
+        os.chmod(temp, 0o700); os.replace(temp, MANAGER_PATH)
+        print('Manager updated successfully. Downloaded version:', version)
+        print('Previous version backup:', backup)
+        print('Exit and run the manager again to load the updated version.')
+    except Exception as e:
+        if temp and temp.exists(): temp.unlink()
+        print(f'Update failed; current manager was preserved: {type(e).__name__}: {e}')
+
+def update_bot_from_github():
+    try:
+        source = fetch(BOT_URL)
+        compile(source, str(BOT), 'exec')
+        if 'def ' not in source or 'BOT' not in source:
+            raise RuntimeError('Downloaded source does not look like a Python bot')
+        if BOT.exists():
+            make_backup('pre-bot-update')
+        # Preserve an existing version marker only if source has no marker; otherwise do not invent one.
+        fd, tmp_name = tempfile.mkstemp(prefix='.xray-checker-bot-', suffix='.py', dir='/usr/local/bin')
+        with os.fdopen(fd, 'w', encoding='utf-8') as f: f.write(source)
+        os.chmod(tmp_name, 0o700); os.replace(tmp_name, BOT)
+        print('Bot source installed from GitHub. Source version:', extract_version(source))
+        print('No service was restarted automatically.')
+        if input('Restart only xray-checker-bot.service now? Type YES to confirm: ').strip() == 'YES':
+            result = run(['systemctl', 'restart', BOT_SERVICE])
+            print(result.stdout or 'Restart command completed.')
+    except Exception as e: print(f'Bot update failed: {type(e).__name__}: {e}')
+
+def set_interval():
+    print('Available intervals: 5, 10, 15, 30, 45 minutes; 1, 6, 12 hours')
+    try: minutes = int(input('Interval in minutes (5/10/15/30/45/60/360/720): ').strip())
+    except ValueError: print('Invalid interval.'); return
+    if minutes not in INTERVALS: print('Invalid interval.'); return
+    INTERVAL_FILE.parent.mkdir(parents=True, exist_ok=True)
+    INTERVAL_FILE.write_text(str(minutes) + '\n', encoding='ascii'); os.chmod(INTERVAL_FILE, 0o600)
+    dropin = Path('/etc/systemd/system/xray-checker-telegram.timer.d/override.conf')
+    dropin.parent.mkdir(parents=True, exist_ok=True)
+    duration = f'{minutes // 60}h' if minutes >= 60 else f'{minutes}min'
+    dropin.write_text('[Timer]\nOnUnitActiveSec=\nOnUnitActiveSec=' + duration + '\n', encoding='utf-8')
+    os.chmod(dropin, 0o600)
+    run(['systemctl', 'daemon-reload'])
+    if run(['systemctl', 'is-active', TIMER]).stdout.strip() == 'active': run(['systemctl', 'restart', TIMER])
+    print('Reporting interval updated. Only the reporting timer was changed.')
+
+def show_metrics_url():
+    print('Metrics / dashboard URL:')
+    print(METRICS_URL)
+    print('Open this URL in a browser. The endpoint may require authentication or a specific path depending on your server configuration.')
+
+def install_command_shortcut():
+    target = Path('/root/xray-checker-manager-v4.py')
+    if not target.is_file():
+        print('Manager file not found:', target)
+        print('Install this file at the standard path first.')
+        return
+    wrapper = "#!/bin/sh\nexec /usr/bin/python3 /root/xray-checker-manager-v4.py \"$@\"\n"
+    COMMAND_PATH.write_text(wrapper, encoding='utf-8')
+    os.chmod(COMMAND_PATH, 0o755)
+    print('Command installed:', COMMAND_PATH)
+    print('From now on, type: xray-checker-manager')
+
+def status():
+    for unit in (BOT_SERVICE, TIMER, REPORT_SERVICE):
+        result = run(['systemctl', 'is-active', unit])
+        print(f'{unit}: {result.stdout.strip() or "unknown"}')
+
+def uninstall():
+    print('This removes bot/reporting components only. BackPack and xray-checker.service will not be touched.')
+    if input('Type REMOVE BOT to confirm: ').strip() != 'REMOVE BOT': print('Cancelled.'); return
+    make_backup('pre-uninstall')
+    for unit in (BOT_SERVICE, TIMER): run(['systemctl', 'disable', '--now', unit])
+    paths = [Path('/usr/local/bin/xray-checker-bot.py'), Path('/usr/local/bin/xray-checker-telegram.py'),
+             Path('/etc/systemd/system/xray-checker-bot.service'), Path('/etc/systemd/system/xray-checker-telegram.service'),
+             Path('/etc/systemd/system/xray-checker-telegram.timer'), Path('/etc/systemd/system/xray-checker-telegram.timer.d/override.conf'),
+             Path('/etc/xray-checker-telegram.env'), INTERVAL_FILE]
+    for p in paths:
         try:
-            if choice == "1":
-                install()
-                if input("Restart the bot service now too? [y/N]: ").strip().lower() == "y":
-                    subprocess.run(["systemctl", "restart", "xray-checker-bot.service"], check=True)
-                    print("Bot service restarted.")
-            elif choice == "2":
-                if input("Restart only xray-checker-bot.service? Type YES to confirm: ").strip() == "YES":
-                    subprocess.run(["systemctl", "restart", "xray-checker-bot.service"], check=True)
-                    print("Restart command completed.")
-            elif choice == "3": backup_files("manual-v4")
-            elif choice == "4": list_backups()
-            elif choice == "5":
-                archive = input("Full path to the .tar.gz backup: ").strip()
-                restore(archive)
-            elif choice == "6":
-                print("Available intervals: 5, 10, 15, 30, 45 minutes; 1, 6, 12 hours")
-                raw = input("Interval in minutes (5/10/15/30/45/60/360/720): ").strip()
-                minutes = int(raw)
-                if minutes not in (5, 10, 15, 30, 45, 60, 360, 720):
-                    print("Invalid interval."); continue
-                INTERVAL_FILE.parent.mkdir(parents=True, exist_ok=True)
-                INTERVAL_FILE.write_text(str(minutes) + "\n", encoding="ascii")
-                os.chmod(INTERVAL_FILE, 0o600)
-                dropin = Path("/etc/systemd/system/xray-checker-telegram.timer.d/override.conf")
-                dropin.parent.mkdir(parents=True, exist_ok=True)
-                duration = f"{minutes // 60}h" if minutes >= 60 else f"{minutes}min"
-                dropin.write_text("[Timer]\nOnUnitActiveSec=\nOnUnitActiveSec=" + duration + "\n", encoding="utf-8")
-                os.chmod(dropin, 0o600)
-                subprocess.run(["systemctl", "daemon-reload"], check=True)
-                state = subprocess.run(["systemctl", "is-active", "xray-checker-telegram.timer"], capture_output=True, text=True)
-                if state.stdout.strip() == "active": subprocess.run(["systemctl", "restart", "xray-checker-telegram.timer"], check=True)
-                print("Reporting interval updated. Only the reporting timer was changed.")
-            elif choice == "7":
-                show_versions()
-                for unit in ("xray-checker-bot.service", "xray-checker-telegram.timer", "xray-checker-telegram.service"):
-                    result = subprocess.run(["systemctl", "is-active", unit], capture_output=True, text=True)
-                    print(f"{unit}: {result.stdout.strip() or 'unknown'}")
-            elif choice == "8":
-                print("This removes only bot/reporting components. BackPack and xray-checker.service will not be removed or changed.")
-                if input("Type REMOVE BOT to confirm: ").strip() != "REMOVE BOT":
-                    print("Cancelled."); continue
-                backup_files("pre-uninstall-v4")
-                subprocess.run(["systemctl", "disable", "--now", "xray-checker-bot.service"], check=False)
-                subprocess.run(["systemctl", "disable", "--now", "xray-checker-telegram.timer"], check=False)
-                paths = ["/usr/local/bin/xray-checker-bot.py", "/usr/local/bin/xray-checker-telegram.py",
-                         "/etc/systemd/system/xray-checker-bot.service", "/etc/systemd/system/xray-checker-telegram.service",
-                         "/etc/systemd/system/xray-checker-telegram.timer", "/etc/systemd/system/xray-checker-telegram.timer.d/override.conf",
-                         "/etc/xray-checker-telegram.env", str(INTERVAL_FILE)]
-                for raw_path in paths:
-                    p = Path(raw_path)
-                    try:
-                        if p.is_file() or p.is_symlink(): p.unlink(); print("Removed:", p)
-                    except OSError as exc: print("Failed to remove", p, exc)
-                subprocess.run(["systemctl", "daemon-reload"], check=False)
-                print("Uninstall completed. The pre-uninstall backup remains in the backup directory.")
-            elif choice == "9": update_manager_from_github()
-            elif choice == "10": show_versions()
-            elif choice == "0": return
-            else: print("Invalid option.")
-        except Exception as exc:
-            print(f"Error: {type(exc).__name__}: {exc}")
-        input("Press Enter to continue...")
+            if p.is_file() or p.is_symlink(): p.unlink(); print('Removed:', p)
+        except OSError as e: print('Failed to remove', p, e)
+    run(['systemctl', 'daemon-reload'])
+    print('Uninstall completed. Backups remain in', BACKUP_DIR)
+
+def menu():
+    while True:
+        installed, _ = bot_versions()
+        print(f'\n========== Xray Checker Manager v{MANAGER_VERSION} ==========')
+        print('Installed bot version:', installed)
+        print('1) Install / update bot source from GitHub')
+        print('2) Restart the bot service')
+        print('3) Create a local backup (keep newest 8)')
+        print('4) List local backups')
+        print('5) Restore a local backup')
+        print('6) Set automatic report interval')
+        print('7) Show bot and reporting service status')
+        print('8) Uninstall bot and reporting components')
+        print('9) Update Manager itself from GitHub')
+        print('10) Show installed and latest versions')
+        print('11) Show metrics dashboard URL')
+        print('12) Install terminal command shortcut')
+        print('0) Exit')
+        choice = input('Select an option: ').strip()
+        try:
+            if choice == '1': update_bot_from_github()
+            elif choice == '2':
+                if input('Restart only xray-checker-bot.service? Type YES to confirm: ').strip() == 'YES':
+                    result = run(['systemctl', 'restart', BOT_SERVICE]); print(result.stdout or 'Restart command completed.')
+            elif choice == '3': make_backup()
+            elif choice == '4': list_backups()
+            elif choice == '5': safe_restore(input('Full path to the .tar.gz backup: ').strip())
+            elif choice == '6': set_interval()
+            elif choice == '7': status()
+            elif choice == '8': uninstall()
+            elif choice == '9': update_manager()
+            elif choice == '10': show_versions()
+            elif choice == '11': show_metrics_url()
+            elif choice == '12': install_command_shortcut()
+            elif choice == '0': return
+            else: print('Invalid option.')
+        except Exception as e: print(f'Error: {type(e).__name__}: {e}')
+        input('Press Enter to continue...')
 
 def main():
-    parser = argparse.ArgumentParser(description=f'Xray Checker Bot Manager v{MANAGER_VERSION} (standalone)')
-    parser.add_argument('--version', action='version', version=f'%(prog)s {MANAGER_VERSION}')
-    subs = parser.add_subparsers(dest='command', required=False)
-    subs.add_parser('backup', help='Create a private backup archive')
-    subs.add_parser('install', help='Back up then install the full replacement bot')
-    subs.add_parser('list-backups', help='List saved backup archives')
-    r = subs.add_parser('restore', help='Restore an archive after confirmation')
-    r.add_argument('archive', help='Full path to backup archive')
-    args = parser.parse_args()
     require_root()
-    if args.command is None:
-        interactive_menu()
-        return
-    if args.command == 'backup':
-        backup_files('manual-v2')
-    elif args.command == 'install':
-        install()
-    elif args.command == 'list-backups':
-        list_backups()
-    elif args.command == 'restore':
-        restore(args.archive)
+    parser = argparse.ArgumentParser(description='Standalone Xray Checker Manager')
+    parser.add_argument('--version', action='store_true')
+    args = parser.parse_args()
+    if args.version: print(f'xray-checker-manager-v4.py {MANAGER_VERSION}'); return
+    menu()
 
-
-if __name__ == '__main__':
-    main()
+if __name__ == '__main__': main()
